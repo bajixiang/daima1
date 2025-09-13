@@ -1,0 +1,293 @@
+# -*- coding: utf-8 -*-
+import os
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import albumentations as A
+from PIL import Image
+from tqdm import tqdm
+import segmentation_models_pytorch as smp
+import warnings
+
+# 禁用警告
+warnings.filterwarnings("ignore")
+
+# ==================== 配置部分 ====================
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+NUM_CLASSES = 6
+TARGET_SIZE = (256, 256)
+
+# ==================== 注意力机制模块 ====================
+class EfficientChannelAttention(nn.Module):
+    def __init__(self, channels, gamma=2, b=1):
+        super(EfficientChannelAttention, self).__init__()
+        self.channels = channels
+        k_size = int(abs((np.log2(channels) + b) / gamma))
+        k_size = k_size if k_size % 2 else k_size + 1
+        
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = y.squeeze(-1).transpose(-1, -2)
+        y = self.conv(y)
+        y = y.transpose(-1, -2).unsqueeze(-1)
+        y = self.sigmoid(y)
+        return x * y.expand_as(x)
+
+class CoordAttention(nn.Module):
+    def __init__(self, in_channels, reduction=32):
+        super(CoordAttention, self).__init__()
+        reduced_channels = max(8, in_channels // reduction)
+        
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        
+        self.conv1 = nn.Conv2d(in_channels, reduced_channels, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(reduced_channels)
+        self.act = nn.ReLU(inplace=True)
+        
+        self.conv_h = nn.Conv2d(reduced_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(reduced_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        identity = x
+        n, c, h, w = x.size()
+        
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+        
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+        
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+        
+        att_h = self.sigmoid(self.conv_h(x_h))
+        att_w = self.sigmoid(self.conv_w(x_w))
+        
+        return identity * att_h * att_w
+
+# ==================== 改进的PSPNet模型 ====================
+class EnhancedPSPNet(nn.Module):
+    def __init__(self, encoder_name='resnet34', in_channels=3, classes=NUM_CLASSES):
+        super().__init__()
+        
+        self.base_model = smp.PSPNet(
+            encoder_name=encoder_name,
+            encoder_weights=None,
+            in_channels=in_channels,
+            classes=classes,
+            activation=None,
+            psp_dropout=0.2
+        )
+        
+        base_output_channels = classes
+        self.eca = EfficientChannelAttention(base_output_channels)
+        self.ca = CoordAttention(base_output_channels)
+        
+        self.extra_processing = nn.Sequential(
+            nn.Conv2d(base_output_channels, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+        
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(32, classes, kernel_size=1),
+            nn.Upsample(size=TARGET_SIZE, mode='bilinear', align_corners=True)
+        )
+        
+        self.activation = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        base_output = self.base_model(x)
+        attended_features = self.eca(base_output)
+        attended_features = self.ca(attended_features)
+        processed_features = self.extra_processing(attended_features)
+        final_output = self.final_conv(processed_features)
+        return self.activation(final_output)
+
+# ==================== 评估数据集类 ====================
+class EvalDataset(Dataset):
+    def __init__(self, image_paths, mask_paths, transform=None):
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+        self.transform = transform
+        
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        mask_path = self.mask_paths[idx]
+        
+        # 加载图像
+        try:
+            image = Image.open(img_path).convert('RGB')
+            image = np.array(image)
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            image = cv2.resize(image, TARGET_SIZE, interpolation=cv2.INTER_AREA)
+        except:
+            image = np.zeros((*TARGET_SIZE, 3), dtype=np.uint8)
+        
+        # 加载标注
+        try:
+            mask = Image.open(mask_path)
+            mask = np.array(mask)
+            if len(mask.shape) == 3:
+                mask = mask[:, :, 0]
+            mask = cv2.resize(mask, TARGET_SIZE, interpolation=cv2.INTER_NEAREST)
+            mask = np.clip(mask, 0, NUM_CLASSES - 1)
+        except:
+            mask = np.zeros(TARGET_SIZE, dtype=np.int64)
+        
+        if self.transform:
+            try:
+                augmented = self.transform(image=image, mask=mask)
+                image, mask = augmented['image'], augmented['mask']
+            except:
+                pass
+            
+        return (image.transpose(2, 0, 1).astype('float32')/255.0, 
+                torch.from_numpy(mask).long())
+
+# ==================== 评估指标计算 ====================
+def calculate_iou(pred_mask, true_mask, num_classes):
+    """计算每个类别的IoU和mIoU"""
+    ious = []
+    for cls in range(num_classes):
+        pred_cls = (pred_mask == cls)
+        true_cls = (true_mask == cls)
+        
+        intersection = np.logical_and(pred_cls, true_cls).sum()
+        union = np.logical_or(pred_cls, true_cls).sum()
+        
+        if union == 0:
+            iou = float('nan')
+        else:
+            iou = intersection / union
+        ious.append(iou)
+    
+    valid_ious = [iou for iou in ious if not np.isnan(iou)]
+    miou = np.mean(valid_ious) if valid_ious else 0
+    
+    return ious, miou
+
+def calculate_pixel_accuracy(pred_mask, true_mask):
+    """计算像素准确率"""
+    return np.mean(pred_mask == true_mask)
+
+# ==================== 加载模型 ====================
+def load_model(model_path, device=DEVICE):
+    """加载训练好的模型"""
+    model = EnhancedPSPNet().to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    print(f"模型已从 {model_path} 加载")
+    return model
+
+# ==================== 简化评估函数 ====================
+def simple_evaluate(model, image_paths, mask_paths, batch_size=4, device=DEVICE):
+    """简化评估，只计算核心指标"""
+    # 创建数据集
+    transform = A.Compose([A.Resize(TARGET_SIZE[0], TARGET_SIZE[1])])
+    dataset = EvalDataset(image_paths, mask_paths, transform)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    
+    all_ious = []
+    all_mious = []
+    all_pixel_accs = []
+    
+    with torch.no_grad():
+        for images, masks in tqdm(loader, desc="评估中"):
+            images, masks = images.to(device), masks.to(device)
+            
+            outputs = model(images)
+            pred_masks = outputs.argmax(dim=1).cpu().numpy()
+            true_masks = masks.cpu().numpy()
+            
+            for pred_mask, true_mask in zip(pred_masks, true_masks):
+                ious, miou = calculate_iou(pred_mask, true_mask, NUM_CLASSES)
+                pixel_acc = calculate_pixel_accuracy(pred_mask, true_mask)
+                
+                all_ious.append(ious)
+                all_mious.append(miou)
+                all_pixel_accs.append(pixel_acc)
+    
+    # 计算平均指标
+    mean_ious = np.nanmean(all_ious, axis=0)
+    mean_miou = np.nanmean(all_mious)
+    mean_pixel_acc = np.mean(all_pixel_accs)
+    
+    return mean_ious, mean_miou, mean_pixel_acc
+
+# ==================== 主函数 ====================
+def main():
+    # 配置路径
+    MODEL_PATH = "pspnet_model_20250913_012741.pth"  # 你的模型路径
+    TEST_IMAGE_DIR = r"E:\\覆冰标注\\JPEGImages"  # 测试图像路径
+    TEST_MASK_DIR = r"E:\\覆冰标注\\PNG"          # 测试标注路径
+    
+    # 检查路径是否存在
+    if not os.path.exists(TEST_IMAGE_DIR):
+        print(f"错误：测试图像路径不存在: {TEST_IMAGE_DIR}")
+        return
+    
+    if not os.path.exists(TEST_MASK_DIR):
+        print(f"错误：测试标注路径不存在: {TEST_MASK_DIR}")
+        return
+    
+    # 获取文件列表
+    def get_files(directory, extensions):
+        if not os.path.exists(directory):
+            return []
+        files = []
+        for f in os.listdir(directory):
+            if f.lower().endswith(extensions) and os.path.isfile(os.path.join(directory, f)):
+                files.append(os.path.join(directory, f))
+        return files
+    
+    test_images = get_files(TEST_IMAGE_DIR, ('.png', '.jpg', '.jpeg'))
+    test_masks = get_files(TEST_MASK_DIR, ('.png',))
+    
+    if not test_images or not test_masks:
+        print("错误：未找到测试文件")
+        return
+    
+    # 简单匹配：取前min(len(test_images), len(test_masks))个文件
+    min_len = min(len(test_images), len(test_masks))
+    test_images = test_images[:min_len]
+    test_masks = test_masks[:min_len]
+    
+    print(f"找到 {min_len} 个测试样本")
+    
+    # 加载模型
+    model = load_model(MODEL_PATH)
+    
+    # 评估模型
+    mean_ious, mean_miou, mean_pixel_acc = simple_evaluate(model, test_images, test_masks)
+    
+    # 打印结果
+    print("=" * 50)
+    print("模型评估结果")
+    print("=" * 50)
+    print(f"平均mIoU: {mean_miou:.4f}")
+    print(f"平均像素准确率: {mean_pixel_acc:.4f}")
+    print("\\n各类别IoU:")
+    class_names = ['Background', 'IcedTower', 'IcedCamera', 'IcedCameraSnow', 'IcedCameraFog', 'CoveredCamera']
+    for i, (iou, class_name) in enumerate(zip(mean_ious, class_names)):
+        print(f"  {class_name}: {iou:.4f}")
+
+if __name__ == "__main__":
+    main()
