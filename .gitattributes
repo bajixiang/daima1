@@ -1,2 +1,460 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# -*- coding: utf-8 -*-
+import os
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+import albumentations as A
+from tqdm import tqdm
+import segmentation_models_pytorch as smp
+import warnings
+import traceback
+import datetime
+from scipy import ndimage
+from PIL import Image
+
+# 禁用所有警告和版本检查
+warnings.filterwarnings("ignore")
+os.environ['ALBUMENTATIONS_DISABLE_VERSION_CHECK'] = '1'
+
+# ==================== 配置部分 ====================
+# 修改为实际路径
+IMAGE_DIR = r"E:\\\\覆冰标注\\\\JPEGImages"  # 原图路径
+MASK_DIR = r"E:\\\\覆冰标注\\\\PNG"  # 标注图路径
+
+# 检查路径是否存在
+if not os.path.exists(IMAGE_DIR):
+    print(f"警告：原图路径不存在: {IMAGE_DIR}")
+    # 尝试使用之前的路径作为备选
+    IMAGE_DIR = r"E:\\\\覆冰标注\\\\PNG"
+    print(f"使用备选原图路径: {IMAGE_DIR}")
+
+if not os.path.exists(MASK_DIR):
+    print(f"警告：标注图路径不存在: {MASK_DIR}")
+    # 尝试使用相同的路径作为备选
+    MASK_DIR = IMAGE_DIR
+    print(f"使用备选标注图路径: {MASK_DIR}")
+
+BATCH_SIZE = 4
+NUM_EPOCHS = 30
+NUM_CLASSES = 6
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+TARGET_SIZE = (256, 256)
+
+# 生成带时间戳的模型名称
+MODEL_NAME = f"pspnet_model_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pth"
+
+# ==================== 注意力机制模块 ====================
+class EfficientChannelAttention(nn.Module):
+    """高效通道注意力机制 (ECA)"""
+    def __init__(self, channels, gamma=2, b=1):
+        super(EfficientChannelAttention, self).__init__()
+        self.channels = channels
+        # 自适应卷积核大小计算
+        k_size = int(abs((np.log2(channels) + b) / gamma))
+        k_size = k_size if k_size % 2 else k_size + 1
+        
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # 全局平均池化
+        y = self.avg_pool(x)
+        # 调整维度 [batch, channels, 1, 1] -> [batch, 1, channels]
+        y = y.squeeze(-1).transpose(-1, -2)
+        # 1D卷积学习通道间关系
+        y = self.conv(y)
+        # 调整维度并应用Sigmoid
+        y = y.transpose(-1, -2).unsqueeze(-1)
+        y = self.sigmoid(y)
+        # 应用注意力权重
+        return x * y.expand_as(x)
+
+class CoordAttention(nn.Module):
+    """坐标注意力机制 (CA)"""
+    def __init__(self, in_channels, reduction=32):
+        super(CoordAttention, self).__init__()
+        reduced_channels = max(8, in_channels // reduction)
+        
+        # 水平方向池化
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        # 垂直方向池化
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        
+        # 共享的1x1卷积层
+        self.conv1 = nn.Conv2d(in_channels, reduced_channels, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(reduced_channels)
+        self.act = nn.ReLU(inplace=True)
+        
+        # 水平方向卷积
+        self.conv_h = nn.Conv2d(reduced_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        # 垂直方向卷积
+        self.conv_w = nn.Conv2d(reduced_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        identity = x
+        n, c, h, w = x.size()
+        
+        # 水平方向池化 [n, c, h, w] -> [n, c, h, 1]
+        x_h = self.pool_h(x)
+        # 垂直方向池化 [n, c, h, w] -> [n, c, 1, w]
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+        
+        # 拼接两个方向的特征
+        y = torch.cat([x_h, x_w], dim=2)
+        # 1x1卷积降维
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+        
+        # 分离水平和垂直特征
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+        
+        # 生成注意力权重
+        att_h = self.sigmoid(self.conv_h(x_h))
+        att_w = self.sigmoid(self.conv_w(x_w))
+        
+        # 应用注意力权重
+        return identity * att_h * att_w
+
+# ==================== 改进的PSPNet模型 ====================
+class EnhancedPSPNet(nn.Module):
+    def __init__(self, encoder_name='resnet34', in_channels=3, classes=NUM_CLASSES):
+        super().__init__()
+        
+        # 使用预训练的PSPNet作为基础
+        self.base_model = smp.PSPNet(
+            encoder_name=encoder_name,
+            encoder_weights='imagenet',
+            in_channels=in_channels,
+            classes=classes,
+            activation=None,
+            psp_dropout=0.2
+        )
+        
+        # 获取基础模型的输出通道数（应该是类别数）
+        base_output_channels = classes
+        
+        # 添加ECA注意力机制 - 输入通道数应该是基础模型的输出通道数
+        self.eca = EfficientChannelAttention(base_output_channels)
+        
+        # 添加CA注意力机制 - 输入通道数应该是基础模型的输出通道数
+        self.ca = CoordAttention(base_output_channels)
+        
+        # 额外的卷积层来处理注意力增强后的特征
+        self.extra_processing = nn.Sequential(
+            nn.Conv2d(base_output_channels, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+        
+        # 最终的分类层
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(32, classes, kernel_size=1),
+            nn.Upsample(size=TARGET_SIZE, mode='bilinear', align_corners=True)
+        )
+        
+        # Softmax激活
+        self.activation = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        # 基础PSPNet前向传播
+        base_output = self.base_model(x)
+        
+        # 应用ECA注意力机制
+        attended_features = self.eca(base_output)
+        
+        # 应用CA注意力机制
+        attended_features = self.ca(attended_features)
+        
+        # 额外的处理
+        processed_features = self.extra_processing(attended_features)
+        
+        # 最终分类（如果需要保持输出尺寸）
+        final_output = self.final_conv(processed_features)
+        
+        return self.activation(final_output)
+# ==================== 数据准备 ====================
+class IceDataset(Dataset):
+    def __init__(self, image_paths, mask_paths, transform=None, is_train=True):
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+        self.transform = transform
+        self.is_train = is_train
+        
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        mask_path = self.mask_paths[idx]
+        
+        try:
+            # 加载图像 - 使用PIL避免中文路径问题
+            image = Image.open(img_path).convert('RGB')
+            image = np.array(image)
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            
+            # 加载标注图 - 使用PIL确保正确读取
+            mask = Image.open(mask_path)
+            mask = np.array(mask)
+            
+            # 如果标注图是RGB格式，需要转换为单通道
+            if len(mask.shape) == 3:
+                mask = mask[:, :, 0]  # 取第一个通道
+                
+            # 确保mask是整数类型
+            mask = mask.astype(np.int64)
+            
+            # 检查标注图数值范围并正确映射到0-5
+            unique_vals = np.unique(mask)
+            if mask.max() >= NUM_CLASSES:
+                print(f"标注图 {os.path.basename(mask_path)} 需要映射: {unique_vals} -> 0-{NUM_CLASSES-1}")
+                # 将标注值映射到0-5范围
+                if mask.max() <= 255:  # 如果是0-255范围
+                    mask = (mask / 255.0 * (NUM_CLASSES - 1)).astype(np.int64)
+                else:  # 如果是其他范围，取模或者特殊处理
+                    mask = np.clip(mask, 0, NUM_CLASSES - 1)
+            
+        except Exception as e:
+            print(f"加载图像 {img_path} 或标注图 {mask_path} 出错：{e}")
+            image = np.zeros((*TARGET_SIZE, 3), dtype=np.uint8)
+            mask = np.zeros(TARGET_SIZE, dtype=np.int64)
+        
+        try:
+            image = cv2.resize(image, TARGET_SIZE, interpolation=cv2.INTER_AREA)
+            mask = cv2.resize(mask, TARGET_SIZE, interpolation=cv2.INTER_NEAREST)
+        except:
+            image = np.zeros((*TARGET_SIZE, 3), dtype=np.uint8)
+            mask = np.zeros(TARGET_SIZE, dtype=np.int64)
+            
+        # 最终确保mask在正确范围内
+        mask = np.clip(mask, 0, NUM_CLASSES - 1)
+        
+        # 检查并打印类别分布（仅在前几个样本显示）
+        if idx < 3:  # 只显示前3个样本的分布
+            unique, counts = np.unique(mask, return_counts=True)
+            print(f"样本 {idx} 类别分布: {dict(zip(unique, counts))}")
+        
+        if self.transform:
+            try:
+                augmented = self.transform(image=image, mask=mask)
+                image, mask = augmented['image'], augmented['mask']
+            except:
+                pass
+            
+        return image.transpose(2, 0, 1).astype('float32')/255.0, torch.from_numpy(mask).long()
+
+# 数据增强
+train_transform = A.Compose([
+    A.Resize(TARGET_SIZE[0], TARGET_SIZE[1]),
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.RandomRotate90(p=0.5),
+    A.RandomBrightnessContrast(p=0.2),
+])
+val_transform = A.Compose([
+    A.Resize(TARGET_SIZE[0], TARGET_SIZE[1]),
+])
+
+print(f"正在从目录加载原图：{IMAGE_DIR}")
+print(f"正在从目录加载标注图：{MASK_DIR}")
+
+# 安全地获取文件列表
+def get_file_list(directory, extensions):
+    try:
+        if not os.path.exists(directory):
+            print(f"目录不存在: {directory}")
+            return []
+        files = [os.path.join(directory, f) for f in os.listdir(directory) 
+                if os.path.isfile(os.path.join(directory, f)) and f.lower().endswith(extensions)]
+        return files
+    except Exception as e:
+        print(f"获取文件列表时出错 {directory}: {e}")
+        return []
+
+# 获取原图和标注图文件列表
+all_images = get_file_list(IMAGE_DIR, ('.png', '.jpg', '.jpeg'))
+all_masks = get_file_list(MASK_DIR, ('.png',))
+
+# 如果原图路径为空，尝试使用标注图路径
+if len(all_images) == 0 and len(all_masks) > 0:
+    print("原图目录为空，尝试使用标注图目录作为原图目录")
+    IMAGE_DIR = MASK_DIR
+    all_images = get_file_list(IMAGE_DIR, ('.png', '.jpg', '.jpeg'))
+
+# 确保文件数量一致
+if len(all_images) != len(all_masks):
+    print(f"警告：原图数量({len(all_images)})和标注图数量({len(all_masks)})不一致")
+    
+    # 如果标注图数量更多，尝试通过文件名匹配
+    if len(all_masks) > len(all_images):
+        print("尝试通过文件名匹配...")
+        matched_masks = []
+        for img_path in all_images:
+            img_name = os.path.splitext(os.path.basename(img_path))[0]
+            # 查找对应的标注文件
+            for mask_path in all_masks:
+                mask_name = os.path.splitext(os.path.basename(mask_path))[0]
+                if img_name == mask_name:
+                    matched_masks.append(mask_path)
+                    break
+            else:
+                matched_masks.append(None)
+        
+        # 只保留有对应标注的原图
+        valid_pairs = [(img, mask) for img, mask in zip(all_images, matched_masks) if mask is not None]
+        if valid_pairs:
+            all_images, all_masks = zip(*valid_pairs)
+            all_images, all_masks = list(all_images), list(all_masks)
+            print(f"通过文件名匹配成功配对 {len(all_images)} 对文件")
+        else:
+            # 如果无法匹配，取最小数量
+            min_count = min(len(all_images), len(all_masks))
+            all_images = all_images[:min_count]
+            all_masks = all_masks[:min_count]
+            print(f"无法通过文件名匹配，取前 {min_count} 个文件")
+
+if len(all_images) == 0:
+    raise FileNotFoundError(f"未找到任何图像文件，请检查路径：{IMAGE_DIR} 和 {MASK_DIR}")
+
+print(f"找到 {len(all_images)} 张原图和标注图")
+
+# 检查前几个标注图的数值范围
+print("\\n检查标注图数值范围...")
+for i in range(min(5, len(all_masks))):
+    mask_path = all_masks[i]
+    try:
+        mask = Image.open(mask_path)
+        mask_array = np.array(mask)
+        if len(mask_array.shape) == 3:
+            mask_array = mask_array[:, :, 0]  # 取第一个通道
+        unique_vals = np.unique(mask_array)
+        print(f"{os.path.basename(mask_path)}: 数值范围 {unique_vals}, 最小值={mask_array.min()}, 最大值={mask_array.max()}")
+    except Exception as e:
+        print(f"无法读取 {mask_path}: {e}")
+
+# 分割训练集和验证集
+train_files, val_files, train_masks, val_masks = train_test_split(
+    all_images, all_masks, test_size=0.2, random_state=42
+)
+
+train_dataset = IceDataset(train_files, train_masks, train_transform, is_train=True)
+val_dataset = IceDataset(val_files, val_masks, val_transform, is_train=False)
+
+train_loader = DataLoader(
+    train_dataset, 
+    batch_size=BATCH_SIZE, 
+    shuffle=True, 
+    num_workers=0,
+    pin_memory=False
+)
+val_loader = DataLoader(
+    val_dataset, 
+    batch_size=BATCH_SIZE, 
+    num_workers=0,
+    pin_memory=False
+)
+
+# ==================== 模型定义 ====================
+model = EnhancedPSPNet().to(DEVICE)
+
+# ==================== 训练设置 ====================
+class_weights = torch.tensor([0.5, 1.5, 1.5, 2.0, 3.0, 1.0]).float().to(DEVICE)
+criterion = nn.CrossEntropyLoss(weight=class_weights)
+optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
+
+# ==================== 训练循环 ====================
+def safe_train_epoch(model, loader, optimizer, criterion):
+    model.train()
+    total_loss, total_batches = 0, 0
+    pbar = tqdm(loader, desc="训练中")
+    for images, masks in pbar:
+        try:
+            images, masks = images.to(DEVICE), masks.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = model(images)
+            
+            if torch.isnan(outputs).any():
+                print("警告：模型输出包含NaN值")
+                continue
+                
+            loss = criterion(outputs, masks)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            total_batches += 1
+            pbar.set_postfix({'loss': loss.item()})
+        except Exception as e:
+            print(f"\\n训练过程中出错: {e}")
+            traceback.print_exc()
+            continue
+    return total_loss / total_batches if total_batches > 0 else float('nan')
+
+def safe_validate(model, loader, criterion):
+    model.eval()
+    total_loss, total_correct, total_pixels = 0, 0, 0
+    pbar = tqdm(loader, desc="验证中")
+    with torch.no_grad():
+        for images, masks in pbar:
+            try:
+                images, masks = images.to(DEVICE), masks.to(DEVICE)
+                outputs = model(images)
+                loss = criterion(outputs, masks)
+                total_loss += loss.item()
+                
+                preds = outputs.argmax(dim=1)
+                total_correct += (preds == masks).sum().item()
+                total_pixels += torch.numel(masks)
+                
+                # 计算每个类别的准确率
+                for class_id in range(NUM_CLASSES):
+                    class_mask = (masks == class_id)
+                    if class_mask.any():
+                        class_correct = (preds[class_mask] == class_id).sum().item()
+                        class_accuracy = class_correct / class_mask.sum().item()
+                        if class_accuracy < 0.5:  # 只显示准确率低的类别
+                            print(f"类别 {class_id} 准确率: {class_accuracy:.2%}")
+                
+                pbar.set_postfix({'val_loss': loss.item()})
+            except Exception as e:
+                print(f"\\n验证过程中出错: {e}")
+                traceback.print_exc()
+                continue
+    
+    accuracy = total_correct / total_pixels if total_pixels > 0 else 0
+    return total_loss / len(loader), accuracy
+
+print("开始训练...")
+best_val_loss = float('inf')
+for epoch in range(NUM_EPOCHS):
+    try:
+        train_loss = safe_train_epoch(model, train_loader, optimizer, criterion)
+        val_loss, val_acc = safe_validate(model, val_loader, criterion)
+        scheduler.step(val_loss)
+        
+        print(f'Epoch {epoch+1}/{NUM_EPOCHS} - 训练损失: {train_loss:.4f}, 验证损失: {val_loss:.4f}, 验证准确率: {val_acc:.2%}')
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), MODEL_NAME)
+            print(f"模型已保存为 {MODEL_NAME}")
+            
+    except Exception as e:
+        print(f"\\nEpoch {epoch+1} 严重出错: {e}")
+        traceback.print_exc()
+        continue
+
+print("训练完成！")
+print(f"最佳模型已保存为: {MODEL_NAME}")
